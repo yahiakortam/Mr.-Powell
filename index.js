@@ -13,6 +13,7 @@ const {
 
 const TOKEN = process.env.TOKEN;
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
+const GUILD_ID = process.env.GUILD_ID;
 
 // Exit early if the bot token is missing
 if (!process.env.TOKEN) {
@@ -91,7 +92,7 @@ client.once('ready', async () => {
     console.log('Registering slash commands globally...');
 
     await rest.put(
-      Routes.applicationCommands(client.user.id),
+      Routes.applicationGuildCommands(client.user.id, GUILD_ID),
       { body: commands }
     );
 
