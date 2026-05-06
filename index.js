@@ -70,6 +70,16 @@ const commands = [
     .toJSON(),
 ];
 
+// ─── Error Listeners ─────────────────────────────────────────────────────────
+
+client.on('error', error => {
+  console.error('Discord client error:', error);
+});
+
+client.on('shardError', error => {
+  console.error('Discord shard error:', error);
+});
+
 // ─── Ready Event ──────────────────────────────────────────────────────────────
 
 client.once('ready', async () => {
@@ -319,7 +329,11 @@ app.listen(PORT, () => {
 
 console.log('Attempting Discord login...');
 
-client.login(TOKEN).catch(error => {
-  console.error('Failed to log into Discord:', error);
-  process.exit(1);
-});
+client.login(TOKEN)
+  .then(() => {
+    console.log('Discord login request succeeded.');
+  })
+  .catch(error => {
+    console.error('Failed to log into Discord:', error);
+    process.exit(1);
+  });
