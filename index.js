@@ -298,6 +298,23 @@ async function handleBanaga(interaction) {
   await interaction.reply(randomMessage);
 }
 
+// ─── Express Web Server ───────────────────────────────────────────────────────
+
+// Render requires a web service to bind to a port.
+// This Express server satisfies that requirement and provides a health check URL
+// you can ping with UptimeRobot or cron-job.org to keep the free instance awake.
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (_req, res) => {
+  res.send('Mr. Powell is awake.');
+});
+
+app.listen(PORT, () => {
+  console.log(`Web server listening on port ${PORT}.`);
+});
+
 // ─── Login ────────────────────────────────────────────────────────────────────
 
 client.login(TOKEN).catch(error => {
