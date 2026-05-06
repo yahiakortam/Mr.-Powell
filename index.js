@@ -1,5 +1,8 @@
 require('dotenv').config();
 
+const fs   = require('fs');
+const path = require('path');
+
 const {
   Client,
   GatewayIntentBits,
@@ -15,13 +18,78 @@ const {
   TextInputStyle,
 } = require('discord.js');
 
-const TOKEN = process.env.TOKEN;
+const TOKEN            = process.env.TOKEN;
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
-const GUILD_ID = process.env.GUILD_ID;
+const GUILD_ID         = process.env.GUILD_ID;
 
-if (!process.env.TOKEN) {
+if (!TOKEN) {
   console.error('ERROR: TOKEN environment variable is missing. The bot cannot start.');
   process.exit(1);
+}
+
+// ─── XP System ────────────────────────────────────────────────────────────────
+// XP is stored in xp.json in the project folder.
+// NOTE: On Render's free tier the filesystem is ephemeral — XP resets on redeploy.
+// To make XP permanent, swap the file functions below for a database (MongoDB Atlas free tier works well).
+
+const XP_FILE = path.join(__dirname, 'xp.json');
+
+const LEVELS = [
+  { number: 1,  title: 'Sitting on the Carpet',       xp: 0    },
+  { number: 2,  title: 'Reluctant Participant',        xp: 50   },
+  { number: 3,  title: 'Triangle Holder',              xp: 150  },
+  { number: 4,  title: 'Drum Circle Member',           xp: 300  },
+  { number: 5,  title: 'Bell Finder',                  xp: 500  },
+  { number: 6,  title: 'Front Row Survivor',           xp: 800  },
+  { number: 7,  title: 'Trusted With the Instruments', xp: 1200 },
+  { number: 8,  title: "Teacher's Favorite",           xp: 1700 },
+  { number: 9,  title: 'Music Room Legend',            xp: 2500 },
+  { number: 10, title: "Mr. Powell's Successor",       xp: 3500 },
+];
+
+function loadXP() {
+  try {
+    if (fs.existsSync(XP_FILE)) return JSON.parse(fs.readFileSync(XP_FILE, 'utf8'));
+  } catch { /* file missing or corrupt — start fresh */ }
+  return {};
+}
+
+function saveXP(data) {
+  try { fs.writeFileSync(XP_FILE, JSON.stringify(data, null, 2)); }
+  catch (err) { console.error('Failed to save XP data:', err); }
+}
+
+function addXP(userId, amount) {
+  const data  = loadXP();
+  data[userId] = (data[userId] || 0) + amount;
+  saveXP(data);
+  return data[userId];
+}
+
+function getXP(userId) {
+  return loadXP()[userId] || 0;
+}
+
+function getLevelInfo(xp) {
+  let current = LEVELS[0];
+  let next    = LEVELS[1];
+  for (let i = LEVELS.length - 1; i >= 0; i--) {
+    if (xp >= LEVELS[i].xp) {
+      current = LEVELS[i];
+      next    = LEVELS[i + 1] || null;
+      break;
+    }
+  }
+  return { current, next };
+}
+
+function buildXPBar(xp, current, next) {
+  if (!next) return '`██████████` MAX LEVEL';
+  const progress = xp - current.xp;
+  const total    = next.xp - current.xp;
+  const filled   = Math.min(10, Math.round((progress / total) * 10));
+  const empty    = 10 - filled;
+  return `\`${'█'.repeat(filled)}${'░'.repeat(empty)}\` ${progress}/${total} XP to next level`;
 }
 
 // ─── Client Setup ────────────────────────────────────────────────────────────
@@ -33,9 +101,11 @@ const client = new Client({
   ],
 });
 
-// Active bell games stored in memory while the bot is running.
-// Key: userId  |  Value: { target, guesses, maxGuesses }
+// Active bell games: userId → { target, guesses, maxGuesses }
 const activeGames = new Map();
+
+// Tracks how many times /banaga has been used this session
+let banagaCount = 0;
 
 // ─── Slash Command Definitions ────────────────────────────────────────────────
 
@@ -48,12 +118,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('discipline')
     .setDescription('Mr. Powell disciplines a student.')
-    .addUserOption(option =>
-      option
-        .setName('user')
-        .setDescription('The student to discipline')
-        .setRequired(true)
-    )
+    .addUserOption(o => o.setName('user').setDescription('The student to discipline').setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -63,30 +128,78 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('level')
-    .setDescription("Check a student's music class level.")
-    .addUserOption(option =>
-      option
-        .setName('user')
-        .setDescription('The student to check (defaults to you)')
-        .setRequired(false)
-    )
+    .setDescription("Check a student's real music class level based on their XP.")
+    .addUserOption(o => o.setName('user').setDescription('The student to check (defaults to you)').setRequired(false))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('xp')
+    .setDescription('Check how much XP you or someone else has.')
+    .addUserOption(o => o.setName('user').setDescription('The student to check (defaults to you)').setRequired(false))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('leaderboard')
+    .setDescription('Mr. Powell posts the class leaderboard.')
     .toJSON(),
 
   new SlashCommandBuilder()
     .setName('banaga')
     .setDescription('...')
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('gametime')
+    .setDescription('Mr. Powell reluctantly dismisses class for gaming.')
+    .addStringOption(o =>
+      o.setName('game')
+        .setDescription('What game is the class playing tonight')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Valorant',     value: 'valorant'  },
+          { name: 'Minecraft',    value: 'minecraft' },
+          { name: 'Tarkov',       value: 'tarkov'    },
+          { name: 'Fortnite',     value: 'fortnite'  },
+          { name: 'Party Games',  value: 'party'     },
+          { name: 'Other',        value: 'other'     },
+        )
+    )
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('mvp')
+    .setDescription("Mr. Powell names tonight's MVP.")
+    .addUserOption(o => o.setName('user').setDescription('The MVP').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('lesson')
+    .setDescription("Mr. Powell announces today's lesson.")
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('absent')
+    .setDescription('Mr. Powell marks a student as absent.')
+    .addUserOption(o => o.setName('user').setDescription('The student who did not show up').setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('powellsays')
+    .setDescription('Mr. Powell shares a piece of wisdom.')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('beef')
+    .setDescription('Mr. Powell mediates a dispute between two students.')
+    .addUserOption(o => o.setName('user1').setDescription('First person').setRequired(true))
+    .addUserOption(o => o.setName('user2').setDescription('Second person').setRequired(true))
+    .toJSON(),
 ];
 
 // ─── Error Listeners ─────────────────────────────────────────────────────────
 
-client.on('error', error => {
-  console.error('Discord client error:', error);
-});
-
-client.on('shardError', error => {
-  console.error('Discord shard error:', error);
-});
+client.on('error',      error => console.error('Discord client error:', error));
+client.on('shardError', error => console.error('Discord shard error:',  error));
 
 // ─── Ready Event ──────────────────────────────────────────────────────────────
 
@@ -96,13 +209,8 @@ client.once('ready', async () => {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
 
   try {
-    console.log('Registering slash commands globally...');
-
-    await rest.put(
-      Routes.applicationGuildCommands(client.user.id, GUILD_ID),
-      { body: commands }
-    );
-
+    console.log('Registering slash commands...');
+    await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
     console.log('Slash commands registered. Class is now in session.');
   } catch (error) {
     console.error('Failed to register slash commands:', error);
@@ -113,11 +221,11 @@ client.once('ready', async () => {
 
 client.on('guildMemberAdd', async (member) => {
   if (!WELCOME_CHANNEL_ID) {
-    console.error('WELCOME_CHANNEL_ID is missing from .env. Cannot send welcome message.');
+    console.error('WELCOME_CHANNEL_ID is missing. Cannot send welcome message.');
     return;
   }
 
-  const welcomeMessages = [
+  const messages = [
     `Welcome ${member}. I'm Mr. Powell. I'll be taking attendance, keeping the instruments safe, and making sure this server doesn't fall apart.`,
     `${member} has entered the music room. I'm Mr. Powell, and I'll be here to guide you through whatever this server turns into.`,
     `Welcome ${member}. I'm Mr. Powell. Find a seat, don't touch the guitar, and try not to get written on the board.`,
@@ -132,14 +240,11 @@ client.on('guildMemberAdd', async (member) => {
 
   try {
     const channel = await client.channels.fetch(WELCOME_CHANNEL_ID);
-
-    if (!channel || !channel.isTextBased()) {
-      console.error(`Welcome channel (ID: ${WELCOME_CHANNEL_ID}) was not found or is not a text channel.`);
+    if (!channel?.isTextBased()) {
+      console.error(`Welcome channel (ID: ${WELCOME_CHANNEL_ID}) not found or not a text channel.`);
       return;
     }
-
-    const randomMessage = welcomeMessages[Math.floor(Math.random() * welcomeMessages.length)];
-    await channel.send(randomMessage);
+    await channel.send(messages[Math.floor(Math.random() * messages.length)]);
   } catch (error) {
     console.error('Failed to send welcome message:', error);
   }
@@ -148,19 +253,14 @@ client.on('guildMemberAdd', async (member) => {
 // ─── Interaction Router ───────────────────────────────────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
-  // Modal submission (guess input from the bell game)
   if (interaction.isModalSubmit()) {
-    if (interaction.customId.startsWith('bell_guess_modal__')) {
-      await handleBellGuessModal(interaction);
-    }
+    if (interaction.customId.startsWith('bell_guess_modal__')) await handleBellGuessModal(interaction);
     return;
   }
 
-  // Button clicks
   if (interaction.isButton()) {
-    if (interaction.customId.startsWith('bell_guess_btn__')) {
-      await handleBellGuessButton(interaction);
-    }
+    if (interaction.customId.startsWith('bell_guess_btn__'))    await handleBellGuessButton(interaction);
+    if (interaction.customId.startsWith('discipline_appeal__')) await handleDisciplineAppeal(interaction);
     return;
   }
 
@@ -171,37 +271,42 @@ client.on('interactionCreate', async (interaction) => {
     case 'discipline':  await handleDiscipline(interaction);  break;
     case 'welcome':     await handleWelcome(interaction);     break;
     case 'level':       await handleLevel(interaction);       break;
+    case 'xp':          await handleXP(interaction);          break;
+    case 'leaderboard': await handleLeaderboard(interaction); break;
     case 'banaga':      await handleBanaga(interaction);      break;
+    case 'gametime':    await handleGametime(interaction);    break;
+    case 'mvp':         await handleMVP(interaction);         break;
+    case 'lesson':      await handleLesson(interaction);      break;
+    case 'absent':      await handleAbsent(interaction);      break;
+    case 'powellsays':  await handlePowellSays(interaction);  break;
+    case 'beef':        await handleBeef(interaction);        break;
   }
 });
 
 // ─── Bell Game Helpers ────────────────────────────────────────────────────────
 
-// Returns heat info based on how far the guess is from the target.
 function getHeat(distance) {
-  if (distance === 0)  return { label: '🔔 FOUND IT',    bar: '🔔🔔🔔🔔🔔🔔🔔🔔🔔🔔', color: 0xFFD700 };
-  if (distance <= 3)   return { label: '🔥 SCORCHING',   bar: '🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥', color: 0xFF0000 };
-  if (distance <= 8)   return { label: '🔥 BURNING',     bar: '🟥🟥🟥🟥🟥🟥🟥🟧🟧🟧', color: 0xFF4500 };
-  if (distance <= 15)  return { label: '♨️ VERY WARM',   bar: '🟧🟧🟧🟧🟧🟧🟧🟦🟦🟦', color: 0xFF8C00 };
-  if (distance <= 25)  return { label: '🌡️ WARM',        bar: '🟨🟨🟨🟨🟨🟨🟦🟦🟦🟦', color: 0xFFD700 };
-  if (distance <= 40)  return { label: '❄️ COLD',        bar: '🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦', color: 0x4169E1 };
-  return                      { label: '🧊 ICE COLD',    bar: '🔵🔵🔵🔵🔵🔵🔵🔵🔵🔵', color: 0x00BFFF };
+  if (distance === 0)  return { label: '🔔 FOUND IT',   bar: '🔔🔔🔔🔔🔔🔔🔔🔔🔔🔔', color: 0xFFD700 };
+  if (distance <= 3)   return { label: '🔥 SCORCHING',  bar: '🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥', color: 0xFF0000 };
+  if (distance <= 8)   return { label: '🔥 BURNING',    bar: '🟥🟥🟥🟥🟥🟥🟥🟧🟧🟧', color: 0xFF4500 };
+  if (distance <= 15)  return { label: '♨️ VERY WARM',  bar: '🟧🟧🟧🟧🟧🟧🟧🟦🟦🟦', color: 0xFF8C00 };
+  if (distance <= 25)  return { label: '🌡️ WARM',       bar: '🟨🟨🟨🟨🟨🟨🟦🟦🟦🟦', color: 0xFFD700 };
+  if (distance <= 40)  return { label: '❄️ COLD',       bar: '🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦', color: 0x4169E1 };
+  return                      { label: '🧊 ICE COLD',   bar: '🔵🔵🔵🔵🔵🔵🔵🔵🔵🔵', color: 0x00BFFF };
 }
 
-// Builds the embed shown for every state of the game.
 function buildBellEmbed(user, guesses, lastHeat, maxGuesses, won, lost, target) {
   const guessesLeft = maxGuesses - guesses.length;
-
   let title, description, color, bar;
 
   if (won) {
     title       = '🔔  Bell Found!';
-    description = `${user} found the bell in **${guesses.length}** guess${guesses.length !== 1 ? 'es' : ''}.\nMr. Powell is speechless. Class may continue.`;
+    description = `${user} found the bell in **${guesses.length}** guess${guesses.length !== 1 ? 'es' : ''}.\nMr. Powell is speechless. Class may continue. **+30 XP**`;
     color       = 0xFFD700;
     bar         = '🔔🔔🔔🔔🔔🔔🔔🔔🔔🔔';
   } else if (lost) {
     title       = '💀  Game Over';
-    description = `${user} ran out of guesses. The bell was at **${target}**.\nMr. Powell is deeply disappointed. The whole class loses recess.`;
+    description = `${user} ran out of guesses. The bell was at **${target}**.\nMr. Powell is deeply disappointed. The whole class loses recess. **+5 XP** for showing up.`;
     color       = 0x808080;
     bar         = '⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛';
   } else if (guesses.length === 0) {
@@ -220,34 +325,29 @@ function buildBellEmbed(user, guesses, lastHeat, maxGuesses, won, lost, target) 
     .setTitle(title)
     .setDescription(description)
     .setColor(color)
-    .addFields({ name: '🎵  Music Volume', value: bar, inline: false });
+    .addFields({ name: '🎵  Music Volume', value: bar });
 
-  // Guess history with warmer / colder arrows
   if (guesses.length > 0) {
     const lines = guesses.map((g, i) => {
       let arrow = '';
       if (i > 0) {
         const prev = Math.abs(guesses[i - 1].number - target);
         const curr = Math.abs(g.number - target);
-        if (curr < prev)      arrow = '  📈 warmer';
-        else if (curr > prev) arrow = '  📉 colder';
-        else                  arrow = '  ↔️ same';
+        arrow = curr < prev ? '  📈 warmer' : curr > prev ? '  📉 colder' : '  ↔️ same';
       }
       return `**${g.number}** → ${g.heat}${arrow}`;
     });
-
-    embed.addFields({ name: '📋  Guess History', value: lines.join('\n'), inline: false });
+    embed.addFields({ name: '📋  Guess History', value: lines.join('\n') });
   }
 
   if (!won && !lost) {
-    embed.addFields({ name: '🎯  Guesses Left', value: `${guessesLeft} of ${maxGuesses}`, inline: false });
+    embed.addFields({ name: '🎯  Guesses Left', value: `${guessesLeft} of ${maxGuesses}` });
     embed.setFooter({ text: 'Click Make a Guess and enter a number between 1 and 100.' });
   }
 
   return embed;
 }
 
-// The single "Make a Guess" button.
 function buildGuessButton(userId, disabled = false) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -259,87 +359,68 @@ function buildGuessButton(userId, disabled = false) {
   );
 }
 
-// ─── Bell Game Command Handlers ───────────────────────────────────────────────
+// ─── Bell Game Handlers ───────────────────────────────────────────────────────
 
-// /findthebell — starts a new game
 async function handleFindTheBell(interaction) {
   if (activeGames.has(interaction.user.id)) {
-    await interaction.reply({
-      content: 'Mr. Powell says you already have an active game. Finish it before starting another.',
-      ephemeral: true,
-    });
+    await interaction.reply({ content: 'Mr. Powell says you already have an active game. Finish it first.', ephemeral: true });
     return;
   }
 
   const target = Math.floor(Math.random() * 100) + 1;
   activeGames.set(interaction.user.id, { target, guesses: [], maxGuesses: 7 });
 
-  const embed = buildBellEmbed(interaction.user, [], null, 7, false, false, target);
-
   await interaction.reply({
-    embeds: [embed],
+    embeds: [buildBellEmbed(interaction.user, [], null, 7, false, false, target)],
     components: [buildGuessButton(interaction.user.id)],
   });
 }
 
-// Button click — shows the modal so the user can type a number
 async function handleBellGuessButton(interaction) {
   const userId = interaction.customId.split('__')[1];
 
   if (interaction.user.id !== userId) {
-    await interaction.reply({
-      content: 'Mr. Powell says this is not your game to play.',
-      ephemeral: true,
-    });
+    await interaction.reply({ content: 'Mr. Powell says this is not your game to play.', ephemeral: true });
     return;
   }
 
-  const game = activeGames.get(userId);
-  if (!game) {
-    await interaction.reply({
-      content: 'No active game found. Use /findthebell to start one.',
-      ephemeral: true,
-    });
+  if (!activeGames.get(userId)) {
+    await interaction.reply({ content: 'No active game. Use /findthebell to start one.', ephemeral: true });
     return;
   }
 
-  const modal = new ModalBuilder()
-    .setCustomId(`bell_guess_modal__${userId}`)
-    .setTitle('🔔 Where is the bell?')
-    .addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('guess_input')
-          .setLabel('Enter a number between 1 and 100')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setMinLength(1)
-          .setMaxLength(3)
-          .setPlaceholder('e.g. 42')
+  await interaction.showModal(
+    new ModalBuilder()
+      .setCustomId(`bell_guess_modal__${userId}`)
+      .setTitle('🔔 Where is the bell?')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('guess_input')
+            .setLabel('Enter a number between 1 and 100')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMinLength(1)
+            .setMaxLength(3)
+            .setPlaceholder('e.g. 42')
+        )
       )
-    );
-
-  await interaction.showModal(modal);
+  );
 }
 
-// Modal submitted — process the guess and update the embed
 async function handleBellGuessModal(interaction) {
   const userId = interaction.customId.split('__')[1];
   const game   = activeGames.get(userId);
 
   if (!game) {
-    await interaction.reply({ content: 'No active game found. Use /findthebell to start one.', ephemeral: true });
+    await interaction.reply({ content: 'No active game. Use /findthebell to start one.', ephemeral: true });
     return;
   }
 
-  const input = interaction.fields.getTextInputValue('guess_input');
-  const guess = parseInt(input, 10);
+  const guess = parseInt(interaction.fields.getTextInputValue('guess_input'), 10);
 
   if (isNaN(guess) || guess < 1 || guess > 100) {
-    await interaction.reply({
-      content: 'Mr. Powell says that is not valid. Enter a whole number between 1 and 100.',
-      ephemeral: true,
-    });
+    await interaction.reply({ content: 'Mr. Powell says that is not valid. Enter a whole number between 1 and 100.', ephemeral: true });
     return;
   }
 
@@ -351,32 +432,82 @@ async function handleBellGuessModal(interaction) {
   const won  = distance === 0;
   const lost = !won && game.guesses.length >= game.maxGuesses;
 
-  if (won || lost) activeGames.delete(userId);
+  if (won || lost) {
+    activeGames.delete(userId);
+    addXP(userId, won ? 30 : 5);
+  }
 
-  const embed      = buildBellEmbed(interaction.user, game.guesses, heat, game.maxGuesses, won, lost, game.target);
-  const components = (won || lost) ? [] : [buildGuessButton(userId)];
-
-  await interaction.update({ embeds: [embed], components });
+  await interaction.update({
+    embeds:     [buildBellEmbed(interaction.user, game.guesses, heat, game.maxGuesses, won, lost, game.target)],
+    components: won || lost ? [] : [buildGuessButton(userId)],
+  });
 }
 
-// ─── Other Command Handlers ───────────────────────────────────────────────────
+// ─── Discipline ───────────────────────────────────────────────────────────────
 
 async function handleDiscipline(interaction) {
-  const targetUser = interaction.options.getUser('user');
+  const target = interaction.options.getUser('user');
 
   const messages = [
-    `${targetUser} has been moved to the front row.`,
-    `Mr. Powell wrote ${targetUser}'s name on the board.`,
-    `${targetUser} has lost instrument privileges.`,
-    `Mr. Powell is silently waiting for ${targetUser} to stop talking.`,
-    `${targetUser} has been separated from the group.`,
-    `${targetUser} is no longer trusted with the tambourine.`,
-    `${targetUser} has been caught talking during music time.`,
-    `${targetUser} must now sit where Mr. Powell can see them.`,
+    `${target} has been moved to the front row.`,
+    `Mr. Powell wrote ${target}'s name on the board.`,
+    `${target} has lost instrument privileges.`,
+    `Mr. Powell is silently waiting for ${target} to stop talking.`,
+    `${target} has been separated from the group.`,
+    `${target} is no longer trusted with the tambourine.`,
+    `${target} has been caught talking during music time.`,
+    `${target} must now sit where Mr. Powell can see them.`,
+    `${target} has been given a warning. This is the last one.`,
+    `Mr. Powell has placed ${target} on the class watchlist.`,
   ];
 
-  await interaction.reply(messages[Math.floor(Math.random() * messages.length)]);
+  const appealButton = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`discipline_appeal__${target.id}`)
+      .setLabel('Appeal to Mr. Powell')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  addXP(target.id, 5);
+
+  await interaction.reply({
+    content:    messages[Math.floor(Math.random() * messages.length)],
+    components: [appealButton],
+  });
 }
+
+async function handleDisciplineAppeal(interaction) {
+  const disciplinedUserId = interaction.customId.split('__')[1];
+
+  if (interaction.user.id !== disciplinedUserId) {
+    await interaction.reply({ content: 'Mr. Powell says this appeal is not yours to file.', ephemeral: true });
+    return;
+  }
+
+  const denials = [
+    "Appeal denied. Mr. Powell does not negotiate.",
+    "Request reviewed. Denied. The board is written in permanent marker.",
+    "Appeal rejected. Mr. Powell has already moved on.",
+    "Denied. Mr. Powell does not operate an appeals process.",
+    "Mr. Powell read the appeal. He disagrees. Denied.",
+    "Appeal denied. Mr. Powell says your behavior speaks for itself.",
+    "Rejected. Mr. Powell said no before he even finished reading it.",
+    "Denied. The decision stands. Mr. Powell has left the room.",
+  ];
+
+  const disabledRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`discipline_appeal__${disciplinedUserId}`)
+      .setLabel('Appeal Denied')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(true)
+  );
+
+  await interaction.update({ components: [disabledRow] });
+  await interaction.followUp(denials[Math.floor(Math.random() * denials.length)]);
+}
+
+// ─── Welcome ──────────────────────────────────────────────────────────────────
 
 async function handleWelcome(interaction) {
   await interaction.reply(
@@ -384,33 +515,93 @@ async function handleWelcome(interaction) {
   );
 }
 
+// ─── Level ────────────────────────────────────────────────────────────────────
+
 async function handleLevel(interaction) {
-  const targetUser = interaction.options.getUser('user') || interaction.user;
+  const target  = interaction.options.getUser('user') || interaction.user;
+  const xp      = getXP(target.id);
+  const { current, next } = getLevelInfo(xp);
 
-  // Levels are random for now.
-  // To add real XP tracking later, replace the random pick with a database
-  // lookup keyed on targetUser.id and calculate the level from stored XP.
-  const levels = [
-    { number: 1,  title: 'Sitting on the Carpet'        },
-    { number: 2,  title: 'Reluctant Participant'         },
-    { number: 3,  title: 'Triangle Holder'               },
-    { number: 4,  title: 'Drum Circle Member'            },
-    { number: 5,  title: 'Bell Finder'                   },
-    { number: 6,  title: 'Front Row Survivor'            },
-    { number: 7,  title: 'Trusted With the Instruments'  },
-    { number: 8,  title: "Teacher's Favorite"            },
-    { number: 9,  title: 'Music Room Legend'             },
-    { number: 10, title: "Mr. Powell's Successor"        },
-  ];
+  const embed = new EmbedBuilder()
+    .setTitle(`🎵 ${target.username}'s Music Class Level`)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Level',    value: `**${current.number} — ${current.title}**`, inline: false },
+      { name: 'Total XP', value: `${xp} XP`,                                inline: true  },
+      { name: 'Progress', value: buildXPBar(xp, current, next),              inline: false },
+    )
+    .setFooter({ text: 'Earn XP by using commands, winning the bell game, and getting disciplined.' });
 
-  const randomLevel = levels[Math.floor(Math.random() * levels.length)];
+  await interaction.reply({ embeds: [embed] });
+}
+
+// ─── XP ───────────────────────────────────────────────────────────────────────
+
+async function handleXP(interaction) {
+  const target  = interaction.options.getUser('user') || interaction.user;
+  const xp      = getXP(target.id);
+  const { current, next } = getLevelInfo(xp);
 
   await interaction.reply(
-    `${targetUser} is currently **Level ${randomLevel.number}: ${randomLevel.title}**.`
+    `${target} has **${xp} XP** — Level **${current.number}: ${current.title}**. ${next ? `Next level at ${next.xp} XP.` : 'Maximum level reached.'}`
   );
 }
 
+// ─── Leaderboard ─────────────────────────────────────────────────────────────
+
+async function handleLeaderboard(interaction) {
+  await interaction.deferReply();
+
+  const data    = loadXP();
+  const sorted  = Object.entries(data).sort(([, a], [, b]) => b - a).slice(0, 10);
+
+  if (sorted.length === 0) {
+    await interaction.editReply('Mr. Powell says nobody has earned any XP yet. Unacceptable.');
+    return;
+  }
+
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines  = await Promise.all(
+    sorted.map(async ([userId, xp], i) => {
+      const { current } = getLevelInfo(xp);
+      try {
+        const user = await client.users.fetch(userId);
+        return `${medals[i] || `**${i + 1}.**`} ${user.username} — ${xp} XP *(${current.title})*`;
+      } catch {
+        return `${medals[i] || `**${i + 1}.**`} Unknown Student — ${xp} XP *(${current.title})*`;
+      }
+    })
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle('📋 Mr. Powell\'s Class Leaderboard')
+    .setDescription(lines.join('\n'))
+    .setColor(0xFFD700)
+    .setFooter({ text: 'Mr. Powell is watching the rankings closely.' });
+
+  await interaction.editReply({ embeds: [embed] });
+}
+
+// ─── Banaga ───────────────────────────────────────────────────────────────────
+
 async function handleBanaga(interaction) {
+  banagaCount++;
+  addXP(interaction.user.id, 3);
+
+  // Escalating responses based on how many times it has been said this session
+  if (banagaCount >= 10) {
+    await interaction.reply('Banaga has been said 10 times. Mr. Powell has left the building. Class is cancelled indefinitely. Everyone go home.');
+    return;
+  }
+  if (banagaCount >= 7) {
+    await interaction.reply(`Banaga count: **${banagaCount}**. Mr. Powell has sent a formal complaint to the principal. This is being documented.`);
+    return;
+  }
+  if (banagaCount >= 5) {
+    await interaction.reply(`Banaga count: **${banagaCount}**. Mr. Powell is on the phone. The word banaga was mentioned. The situation is escalating.`);
+    return;
+  }
+
   const messages = [
     'Mr. Powell heard banaga and stopped the entire lesson.',
     'Banaga has been added to the lesson plan.',
@@ -419,9 +610,132 @@ async function handleBanaga(interaction) {
     'Banaga detected. Recorder test postponed.',
     'Someone said banaga and now Mr. Powell is standing silently at the front of the room.',
     'Banaga has been reported to the principal.',
+    'Mr. Powell wrote banaga on a notepad and stared at it for thirty seconds.',
+    'Banaga is not a word Mr. Powell recognizes, and yet here we are.',
   ];
 
   await interaction.reply(messages[Math.floor(Math.random() * messages.length)]);
+}
+
+// ─── Gametime ─────────────────────────────────────────────────────────────────
+
+async function handleGametime(interaction) {
+  const game = interaction.options.getString('game');
+
+  const responses = {
+    valorant:  "Fine. Valorant. Mr. Powell does not know what that is, but he expects everyone back in their seats before sunrise. Do not embarrass Made New.",
+    minecraft: "Minecraft. Mr. Powell has been told this involves building and survival. He approves of structure and preparation. Class dismissed.",
+    tarkov:    "Tarkov. Mr. Powell looked this up. He is concerned about the content. He is more concerned that you enjoy it. Class dismissed. Be careful.",
+    fortnite:  "Fortnite. Mr. Powell confiscated a student's phone for playing this in 2018. He has not changed his opinion. Class dismissed regardless.",
+    party:     "Party games. Mr. Powell respects structured group activities. Do not let it get loud. If someone cries, class is back in session immediately.",
+    other:     "Mr. Powell does not know what you are playing tonight. He chose not to ask. Class dismissed. Make good decisions.",
+  };
+
+  addXP(interaction.user.id, 5);
+  await interaction.reply(responses[game]);
+}
+
+// ─── MVP ──────────────────────────────────────────────────────────────────────
+
+async function handleMVP(interaction) {
+  const target = interaction.options.getUser('user');
+
+  const messages = [
+    `Mr. Powell has named ${target} as tonight's MVP. They have been awarded First Chair, which carries no actual privileges but significant respect.`,
+    `Tonight's MVP is ${target}. Mr. Powell noticed, which is rare. He is still processing his feelings about it.`,
+    `${target} has been named MVP by Mr. Powell. They are now Trusted With the Instruments, effective immediately.`,
+    `Mr. Powell is presenting the Made New MVP award to ${target}. The class applauds. Mr. Powell does not clap, but he nods.`,
+    `${target} played exceptionally tonight. Mr. Powell has updated the gradebook accordingly. This is high praise.`,
+  ];
+
+  addXP(target.id, 40);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🏆 MVP of the Night')
+    .setDescription(messages[Math.floor(Math.random() * messages.length)])
+    .setColor(0xFFD700)
+    .setFooter({ text: '+40 XP awarded.' });
+
+  await interaction.reply({ embeds: [embed] });
+}
+
+// ─── Lesson ───────────────────────────────────────────────────────────────────
+
+async function handleLesson(interaction) {
+  const lessons = [
+    "**Today's lesson: Dynamics.** Knowing when to be loud and when to be quiet. This applies to Valorant. It applies to Tarkov. It applies to everything. Mr. Powell has been saying this for years.",
+    "**Today's lesson: Rest.** In music, a rest is not a mistake. It is intentional silence. Some of you should try it.",
+    "**Today's lesson: Harmony.** Multiple parts working together toward one sound. If your squad cannot figure this out, that is a music problem and Mr. Powell can help.",
+    "**Today's lesson: Tempo.** Staying on beat with your team. Rushing ahead causes chaos. Falling behind causes failure. This is true in music and in Tarkov.",
+    "**Today's lesson: Improvisation.** Sometimes the plan falls apart and you make something up. Mr. Powell respects this, within reason.",
+    "**Today's lesson: The Recorder.** Nobody asked for this lesson. It is happening anyway. Mr. Powell will not apologize.",
+    "**Today's lesson: Listening.** You cannot play well if you are not listening. Mr. Powell has said this approximately 400 times. He will say it again.",
+    "**Today's lesson: Knowing your role.** The triangle player does not try to be the drum. The support player does not try to be the carry. These are the same lesson.",
+    "**Today's lesson: Practice.** You do not get better by accident. Mr. Powell is looking at your stats.",
+    "**Today's lesson: Finishing what you start.** You do not walk off stage mid-performance. You do not leave the game mid-match. Mr. Powell has noted who does both.",
+  ];
+
+  addXP(interaction.user.id, 2);
+  await interaction.reply(lessons[Math.floor(Math.random() * lessons.length)]);
+}
+
+// ─── Absent ───────────────────────────────────────────────────────────────────
+
+async function handleAbsent(interaction) {
+  const target = interaction.options.getUser('user');
+
+  const messages = [
+    `${target} was not present for class tonight. Mr. Powell has noted it. This will be on their permanent record.`,
+    `Marked absent: ${target}. Mr. Powell attempted to reach them. There was no response. This is concerning.`,
+    `${target} did not show up. Mr. Powell has placed a strongly worded note in their file and moved on.`,
+    `${target} is absent. Mr. Powell is not surprised. He is disappointed, which is worse.`,
+    `Attendance updated. ${target} is not here. Mr. Powell will be remembering this.`,
+  ];
+
+  await interaction.reply(messages[Math.floor(Math.random() * messages.length)]);
+}
+
+// ─── Powell Says ──────────────────────────────────────────────────────────────
+
+async function handlePowellSays(interaction) {
+  const quotes = [
+    "The most important skill in music is listening to what the people around you are playing. I assume the same applies to whatever you are doing tonight.",
+    "Practice does not make perfect. Practice makes permanent. If you keep doing something wrong, you will get permanently wrong at it. Think about that.",
+    "A good musician knows when not to play. Consider this the next time you decide to push alone.",
+    "I cannot teach someone who does not want to learn. I also cannot carry them. These are related thoughts.",
+    "Every instrument has a role. The triangle player does not try to be the drum. Remember this.",
+    "Tempo is everything. Do not rush. Do not fall behind. Stay with your team. This is music. This is also everything else.",
+    "Mr. Powell once watched a student play the recorder with their nose. He has seen things. You cannot surprise him.",
+    "If you make a mistake, you keep going. You do not stop in the middle of the song and explain yourself. You finish and you reflect later.",
+    "Class participation is forty percent of your grade. Mr. Powell is always watching.",
+    "The best performers are not always the most talented. They are the most prepared. Prepare.",
+    "Mr. Powell does not play favorites. But Mr. Powell does notice who shows up and who does not.",
+    "Music teaches you to fail in front of people and continue anyway. This is the most useful skill Mr. Powell has ever taught.",
+  ];
+
+  addXP(interaction.user.id, 2);
+  await interaction.reply(`*"${quotes[Math.floor(Math.random() * quotes.length)]}"*\n— Mr. Powell`);
+}
+
+// ─── Beef ─────────────────────────────────────────────────────────────────────
+
+async function handleBeef(interaction) {
+  const user1 = interaction.options.getUser('user1');
+  const user2 = interaction.options.getUser('user2');
+
+  // Randomly pick a winner and a loser
+  const [winner, loser] = Math.random() < 0.5 ? [user1, user2] : [user2, user1];
+
+  const verdicts = [
+    `Mr. Powell has reviewed the situation between ${user1} and ${user2}. After careful consideration, ${winner} was right. ${loser} should reflect on their behavior. This is final.`,
+    `Mr. Powell heard both sides. ${loser} is the problem. ${winner} is excused. ${loser} has been added to the watchlist.`,
+    `After thorough review, Mr. Powell sides with ${winner}. ${loser}'s argument was noted and dismissed. The board has been updated.`,
+    `Mr. Powell does not enjoy mediating disputes. He has done it anyway. ${winner} is correct. ${loser} needs to think about what they said.`,
+    `Verdict: ${winner} wins. ${loser} loses. Mr. Powell is moving on and expects everyone else to as well.`,
+    `Mr. Powell listened to both sides and found ${loser} unconvincing. ${winner} may return to their seat. ${loser} may not.`,
+  ];
+
+  await interaction.reply(verdicts[Math.floor(Math.random() * verdicts.length)]);
 }
 
 // ─── Express Web Server ───────────────────────────────────────────────────────
@@ -430,22 +744,16 @@ const express = require('express');
 const app     = express();
 const PORT    = process.env.PORT || 3000;
 
-app.get('/', (_req, res) => {
-  res.send('Mr. Powell is awake.');
-});
+app.get('/', (_req, res) => res.send('Mr. Powell is awake.'));
 
-app.listen(PORT, () => {
-  console.log(`Web server listening on port ${PORT}.`);
-});
+app.listen(PORT, () => console.log(`Web server listening on port ${PORT}.`));
 
 // ─── Login ────────────────────────────────────────────────────────────────────
 
 console.log('Attempting Discord login...');
 
 client.login(TOKEN)
-  .then(() => {
-    console.log('Discord login request succeeded.');
-  })
+  .then(() => console.log('Discord login request succeeded.'))
   .catch(error => {
     console.error('Failed to log into Discord:', error);
     console.error('The bot will stay running so Render does not restart and worsen any rate limit.');
