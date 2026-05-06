@@ -15,8 +15,8 @@ const TOKEN = process.env.TOKEN;
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
 
 // Exit early if the bot token is missing
-if (!TOKEN) {
-  console.error('ERROR: TOKEN is missing from your .env file. The bot cannot start.');
+if (!process.env.TOKEN) {
+  console.error('ERROR: TOKEN environment variable is missing. The bot cannot start.');
   process.exit(1);
 }
 
@@ -73,7 +73,7 @@ const commands = [
 // ─── Ready Event ──────────────────────────────────────────────────────────────
 
 client.once('ready', async () => {
-  console.log(`Mr. Powell has entered the music room as ${client.user.tag}.`);
+  console.log(`Logged in as ${client.user.tag}.`);
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
 
@@ -317,7 +317,9 @@ app.listen(PORT, () => {
 
 // ─── Login ────────────────────────────────────────────────────────────────────
 
+console.log('Attempting Discord login...');
+
 client.login(TOKEN).catch(error => {
-  console.error('Failed to log in. Double-check your TOKEN in .env:', error.message);
+  console.error('Failed to log into Discord:', error);
   process.exit(1);
 });
