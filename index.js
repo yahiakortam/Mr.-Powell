@@ -9,13 +9,16 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 
 const TOKEN = process.env.TOKEN;
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
-// Exit early if the bot token is missing
 if (!process.env.TOKEN) {
   console.error('ERROR: TOKEN environment variable is missing. The bot cannot start.');
   process.exit(1);
@@ -26,16 +29,20 @@ if (!process.env.TOKEN) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // Required for the guildMemberAdd event
+    GatewayIntentBits.GuildMembers,
   ],
 });
+
+// Active bell games stored in memory while the bot is running.
+// Key: userId  |  Value: { target, guesses, maxGuesses }
+const activeGames = new Map();
 
 // ─── Slash Command Definitions ────────────────────────────────────────────────
 
 const commands = [
   new SlashCommandBuilder()
     .setName('findthebell')
-    .setDescription('Mr. Powell hid the bell. Find it before class starts.')
+    .setDescription('Mr. Powell hid the bell somewhere between 1 and 100. Find it.')
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -141,76 +148,145 @@ client.on('guildMemberAdd', async (member) => {
 // ─── Interaction Router ───────────────────────────────────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
-  // Route button clicks to the bell game handler
+  // Modal submission (guess input from the bell game)
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId.startsWith('bell_guess_modal__')) {
+      await handleBellGuessModal(interaction);
+    }
+    return;
+  }
+
+  // Button clicks
   if (interaction.isButton()) {
-    await handleBellButton(interaction);
+    if (interaction.customId.startsWith('bell_guess_btn__')) {
+      await handleBellGuessButton(interaction);
+    }
     return;
   }
 
   if (!interaction.isChatInputCommand()) return;
 
   switch (interaction.commandName) {
-    case 'findthebell':
-      await handleFindTheBell(interaction);
-      break;
-    case 'discipline':
-      await handleDiscipline(interaction);
-      break;
-    case 'welcome':
-      await handleWelcome(interaction);
-      break;
-    case 'level':
-      await handleLevel(interaction);
-      break;
-    case 'banaga':
-      await handleBanaga(interaction);
-      break;
+    case 'findthebell': await handleFindTheBell(interaction); break;
+    case 'discipline':  await handleDiscipline(interaction);  break;
+    case 'welcome':     await handleWelcome(interaction);     break;
+    case 'level':       await handleLevel(interaction);       break;
+    case 'banaga':      await handleBanaga(interaction);      break;
   }
 });
 
-// ─── Command Handlers ─────────────────────────────────────────────────────────
+// ─── Bell Game Helpers ────────────────────────────────────────────────────────
 
-// /findthebell — Guessing game with four location buttons
-async function handleFindTheBell(interaction) {
-  const locations = [
-    { label: 'Under the Piano',        id: 'under_piano'   },
-    { label: 'Inside the Recorder Bin', id: 'recorder_bin'  },
-    { label: 'Behind the Drum',        id: 'behind_drum'   },
-    { label: "On Mr. Powell's Desk",   id: 'desk'          },
-  ];
+// Returns heat info based on how far the guess is from the target.
+function getHeat(distance) {
+  if (distance === 0)  return { label: '🔔 FOUND IT',    bar: '🔔🔔🔔🔔🔔🔔🔔🔔🔔🔔', color: 0xFFD700 };
+  if (distance <= 3)   return { label: '🔥 SCORCHING',   bar: '🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥', color: 0xFF0000 };
+  if (distance <= 8)   return { label: '🔥 BURNING',     bar: '🟥🟥🟥🟥🟥🟥🟥🟧🟧🟧', color: 0xFF4500 };
+  if (distance <= 15)  return { label: '♨️ VERY WARM',   bar: '🟧🟧🟧🟧🟧🟧🟧🟦🟦🟦', color: 0xFF8C00 };
+  if (distance <= 25)  return { label: '🌡️ WARM',        bar: '🟨🟨🟨🟨🟨🟨🟦🟦🟦🟦', color: 0xFFD700 };
+  if (distance <= 40)  return { label: '❄️ COLD',        bar: '🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦', color: 0x4169E1 };
+  return                      { label: '🧊 ICE COLD',    bar: '🔵🔵🔵🔵🔵🔵🔵🔵🔵🔵', color: 0x00BFFF };
+}
 
-  // Pick a random winning location for this round
-  const correctIndex = Math.floor(Math.random() * locations.length);
-  const correctId = locations[correctIndex].id;
+// Builds the embed shown for every state of the game.
+function buildBellEmbed(user, guesses, lastHeat, maxGuesses, won, lost, target) {
+  const guessesLeft = maxGuesses - guesses.length;
 
-  // Each button's custom ID encodes: the location, the caller's user ID, and the correct answer
-  // Format: bell__{locationId}__{userId}__{correctId}
-  const buttons = locations.map(loc =>
+  let title, description, color, bar;
+
+  if (won) {
+    title       = '🔔  Bell Found!';
+    description = `${user} found the bell in **${guesses.length}** guess${guesses.length !== 1 ? 'es' : ''}.\nMr. Powell is speechless. Class may continue.`;
+    color       = 0xFFD700;
+    bar         = '🔔🔔🔔🔔🔔🔔🔔🔔🔔🔔';
+  } else if (lost) {
+    title       = '💀  Game Over';
+    description = `${user} ran out of guesses. The bell was at **${target}**.\nMr. Powell is deeply disappointed. The whole class loses recess.`;
+    color       = 0x808080;
+    bar         = '⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛';
+  } else if (guesses.length === 0) {
+    title       = '🔔  Find the Bell';
+    description = `Mr. Powell has hidden the bell somewhere between **1** and **100**.\nThe music gets louder the closer you are. You have **${maxGuesses}** guesses.`;
+    color       = 0x5865F2;
+    bar         = '⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜';
+  } else {
+    title       = '🔔  Find the Bell';
+    description = `Last guess: **${guesses[guesses.length - 1].number}**  —  ${lastHeat.label}`;
+    color       = lastHeat.color;
+    bar         = lastHeat.bar;
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor(color)
+    .addFields({ name: '🎵  Music Volume', value: bar, inline: false });
+
+  // Guess history with warmer / colder arrows
+  if (guesses.length > 0) {
+    const lines = guesses.map((g, i) => {
+      let arrow = '';
+      if (i > 0) {
+        const prev = Math.abs(guesses[i - 1].number - target);
+        const curr = Math.abs(g.number - target);
+        if (curr < prev)      arrow = '  📈 warmer';
+        else if (curr > prev) arrow = '  📉 colder';
+        else                  arrow = '  ↔️ same';
+      }
+      return `**${g.number}** → ${g.heat}${arrow}`;
+    });
+
+    embed.addFields({ name: '📋  Guess History', value: lines.join('\n'), inline: false });
+  }
+
+  if (!won && !lost) {
+    embed.addFields({ name: '🎯  Guesses Left', value: `${guessesLeft} of ${maxGuesses}`, inline: false });
+    embed.setFooter({ text: 'Click Make a Guess and enter a number between 1 and 100.' });
+  }
+
+  return embed;
+}
+
+// The single "Make a Guess" button.
+function buildGuessButton(userId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`bell__${loc.id}__${interaction.user.id}__${correctId}`)
-      .setLabel(loc.label)
+      .setCustomId(`bell_guess_btn__${userId}`)
+      .setLabel('Make a Guess')
       .setStyle(ButtonStyle.Primary)
+      .setEmoji('🔔')
+      .setDisabled(disabled)
   );
+}
 
-  const row = new ActionRowBuilder().addComponents(buttons);
+// ─── Bell Game Command Handlers ───────────────────────────────────────────────
+
+// /findthebell — starts a new game
+async function handleFindTheBell(interaction) {
+  if (activeGames.has(interaction.user.id)) {
+    await interaction.reply({
+      content: 'Mr. Powell says you already have an active game. Finish it before starting another.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const target = Math.floor(Math.random() * 100) + 1;
+  activeGames.set(interaction.user.id, { target, guesses: [], maxGuesses: 7 });
+
+  const embed = buildBellEmbed(interaction.user, [], null, 7, false, false, target);
 
   await interaction.reply({
-    content: 'Mr. Powell hid the bell somewhere in the music room. Find it before class starts.',
-    components: [row],
+    embeds: [embed],
+    components: [buildGuessButton(interaction.user.id)],
   });
 }
 
-// Button click handler — only called when a /findthebell button is clicked
-async function handleBellButton(interaction) {
-  // Custom ID format: bell__{choiceId}__{userId}__{correctId}
-  const parts = interaction.customId.split('__');
+// Button click — shows the modal so the user can type a number
+async function handleBellGuessButton(interaction) {
+  const userId = interaction.customId.split('__')[1];
 
-  if (parts[0] !== 'bell' || parts.length !== 4) return;
-
-  const [, choiceId, originalUserId, correctId] = parts;
-
-  // Reject clicks from anyone other than the user who ran the command
-  if (interaction.user.id !== originalUserId) {
+  if (interaction.user.id !== userId) {
     await interaction.reply({
       content: 'Mr. Powell says this is not your game to play.',
       ephemeral: true,
@@ -218,28 +294,73 @@ async function handleBellButton(interaction) {
     return;
   }
 
-  // Rebuild all buttons in a disabled state so the game is locked after one guess
-  const disabledButtons = interaction.message.components[0].components.map(button =>
-    new ButtonBuilder()
-      .setCustomId(button.customId)
-      .setLabel(button.label)
-      .setStyle(button.style)
-      .setDisabled(true)
-  );
+  const game = activeGames.get(userId);
+  if (!game) {
+    await interaction.reply({
+      content: 'No active game found. Use /findthebell to start one.',
+      ephemeral: true,
+    });
+    return;
+  }
 
-  const disabledRow = new ActionRowBuilder().addComponents(disabledButtons);
+  const modal = new ModalBuilder()
+    .setCustomId(`bell_guess_modal__${userId}`)
+    .setTitle('🔔 Where is the bell?')
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('guess_input')
+          .setLabel('Enter a number between 1 and 100')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMinLength(1)
+          .setMaxLength(3)
+          .setPlaceholder('e.g. 42')
+      )
+    );
 
-  const resultMessage = choiceId === correctId
-    ? 'You found the bell. Mr. Powell allows class to continue.'
-    : 'Wrong. Mr. Powell is disappointed and the whole class loses 2 minutes of recess.';
-
-  await interaction.update({
-    content: resultMessage,
-    components: [disabledRow],
-  });
+  await interaction.showModal(modal);
 }
 
-// /discipline — Calls out a user with a random message
+// Modal submitted — process the guess and update the embed
+async function handleBellGuessModal(interaction) {
+  const userId = interaction.customId.split('__')[1];
+  const game   = activeGames.get(userId);
+
+  if (!game) {
+    await interaction.reply({ content: 'No active game found. Use /findthebell to start one.', ephemeral: true });
+    return;
+  }
+
+  const input = interaction.fields.getTextInputValue('guess_input');
+  const guess = parseInt(input, 10);
+
+  if (isNaN(guess) || guess < 1 || guess > 100) {
+    await interaction.reply({
+      content: 'Mr. Powell says that is not valid. Enter a whole number between 1 and 100.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const distance = Math.abs(guess - game.target);
+  const heat     = getHeat(distance);
+
+  game.guesses.push({ number: guess, heat: heat.label });
+
+  const won  = distance === 0;
+  const lost = !won && game.guesses.length >= game.maxGuesses;
+
+  if (won || lost) activeGames.delete(userId);
+
+  const embed      = buildBellEmbed(interaction.user, game.guesses, heat, game.maxGuesses, won, lost, game.target);
+  const components = (won || lost) ? [] : [buildGuessButton(userId)];
+
+  await interaction.update({ embeds: [embed], components });
+}
+
+// ─── Other Command Handlers ───────────────────────────────────────────────────
+
 async function handleDiscipline(interaction) {
   const targetUser = interaction.options.getUser('user');
 
@@ -254,36 +375,32 @@ async function handleDiscipline(interaction) {
     `${targetUser} must now sit where Mr. Powell can see them.`,
   ];
 
-  const randomMessage = messages[Math.floor(Math.random() * messages.length)];
-  await interaction.reply(randomMessage);
+  await interaction.reply(messages[Math.floor(Math.random() * messages.length)]);
 }
 
-// /welcome — Posts the official class welcome message
 async function handleWelcome(interaction) {
   await interaction.reply(
     "Welcome to Made New. Mr. Powell has taken attendance. Keep your hands to yourself, don't touch the instruments without permission, and join VC when instructed."
   );
 }
 
-// /level — Gives a user a random music-class level
 async function handleLevel(interaction) {
-  // Default to whoever ran the command if no user is specified
   const targetUser = interaction.options.getUser('user') || interaction.user;
 
   // Levels are random for now.
-  // To add real XP tracking later, replace the random pick below with a
-  // database lookup keyed on targetUser.id and calculate the level from stored XP.
+  // To add real XP tracking later, replace the random pick with a database
+  // lookup keyed on targetUser.id and calculate the level from stored XP.
   const levels = [
-    { number: 1,  title: 'Sitting on the Carpet'         },
-    { number: 2,  title: 'Reluctant Participant'          },
-    { number: 3,  title: 'Triangle Holder'                },
-    { number: 4,  title: 'Drum Circle Member'             },
-    { number: 5,  title: 'Bell Finder'                    },
-    { number: 6,  title: 'Front Row Survivor'             },
-    { number: 7,  title: 'Trusted With the Instruments'   },
-    { number: 8,  title: "Teacher's Favorite"             },
-    { number: 9,  title: 'Music Room Legend'              },
-    { number: 10, title: "Mr. Powell's Successor"         },
+    { number: 1,  title: 'Sitting on the Carpet'        },
+    { number: 2,  title: 'Reluctant Participant'         },
+    { number: 3,  title: 'Triangle Holder'               },
+    { number: 4,  title: 'Drum Circle Member'            },
+    { number: 5,  title: 'Bell Finder'                   },
+    { number: 6,  title: 'Front Row Survivor'            },
+    { number: 7,  title: 'Trusted With the Instruments'  },
+    { number: 8,  title: "Teacher's Favorite"            },
+    { number: 9,  title: 'Music Room Legend'             },
+    { number: 10, title: "Mr. Powell's Successor"        },
   ];
 
   const randomLevel = levels[Math.floor(Math.random() * levels.length)];
@@ -293,7 +410,6 @@ async function handleLevel(interaction) {
   );
 }
 
-// /banaga — Responds with a random banaga message
 async function handleBanaga(interaction) {
   const messages = [
     'Mr. Powell heard banaga and stopped the entire lesson.',
@@ -305,18 +421,14 @@ async function handleBanaga(interaction) {
     'Banaga has been reported to the principal.',
   ];
 
-  const randomMessage = messages[Math.floor(Math.random() * messages.length)];
-  await interaction.reply(randomMessage);
+  await interaction.reply(messages[Math.floor(Math.random() * messages.length)]);
 }
 
 // ─── Express Web Server ───────────────────────────────────────────────────────
 
-// Render requires a web service to bind to a port.
-// This Express server satisfies that requirement and provides a health check URL
-// you can ping with UptimeRobot or cron-job.org to keep the free instance awake.
 const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
+const app     = express();
+const PORT    = process.env.PORT || 3000;
 
 app.get('/', (_req, res) => {
   res.send('Mr. Powell is awake.');
@@ -335,8 +447,6 @@ client.login(TOKEN)
     console.log('Discord login request succeeded.');
   })
   .catch(error => {
-    // Log the error but do NOT exit — exiting causes Render to restart immediately,
-    // which hammers Discord's API again and makes rate limiting worse.
     console.error('Failed to log into Discord:', error);
-    console.error('The bot will stay running so Render does not restart and worsen the rate limit.');
+    console.error('The bot will stay running so Render does not restart and worsen any rate limit.');
   });
