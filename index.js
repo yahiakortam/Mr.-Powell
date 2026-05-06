@@ -327,29 +327,15 @@ app.listen(PORT, () => {
 
 // ─── Login ────────────────────────────────────────────────────────────────────
 
-// Test whether Render can reach Discord's API at all before attempting login.
-// If this fails, the problem is network connectivity, not the token.
-const https = require('https');
-https.get('https://discord.com/api/v10/gateway', (res) => {
-  console.log(`Discord API reachable. HTTP status: ${res.statusCode}`);
-}).on('error', (err) => {
-  console.error('Cannot reach Discord API — network may be blocked:', err.message);
-});
-
-// Warn if login takes longer than 15 seconds — points to a WebSocket hang.
-const loginTimeout = setTimeout(() => {
-  console.error('WARNING: Discord login has been pending for 15 seconds with no response. Possible WebSocket block or bad token.');
-}, 15000);
-
 console.log('Attempting Discord login...');
 
 client.login(TOKEN)
   .then(() => {
-    clearTimeout(loginTimeout);
     console.log('Discord login request succeeded.');
   })
   .catch(error => {
-    clearTimeout(loginTimeout);
+    // Log the error but do NOT exit — exiting causes Render to restart immediately,
+    // which hammers Discord's API again and makes rate limiting worse.
     console.error('Failed to log into Discord:', error);
-    process.exit(1);
+    console.error('The bot will stay running so Render does not restart and worsen the rate limit.');
   });
