@@ -61,7 +61,7 @@ function saveXP(data) {
 
 function addXP(userId, amount) {
   const data  = loadXP();
-  data[userId] = (data[userId] || 0) + amount;
+  data[userId] = Math.max(0, (data[userId] || 0) + amount);
   saveXP(data);
   return data[userId];
 }
@@ -106,6 +106,13 @@ const activeGames = new Map();
 
 // Tracks how many times /banaga has been used this session
 let banagaCount = 0;
+
+// ─── Multiplayer Game State ───────────────────────────────────────────────────
+let activeHeist   = null;
+let activeAuction = null;
+let activeQuiz    = null;
+const activeDuels  = new Map();
+const mvpCooldowns = new Map(); // userId → timestamp of last /mvp use
 
 // ─── Slash Command Definitions ────────────────────────────────────────────────
 
@@ -194,6 +201,27 @@ const commands = [
     .addUserOption(o => o.setName('user1').setDescription('First person').setRequired(true))
     .addUserOption(o => o.setName('user2').setDescription('Second person').setRequired(true))
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('heist')
+    .setDescription("Organize a heist on Mr. Powell's bell room. Others can join.")
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('auction')
+    .setDescription('Mr. Powell auctions a class title. Bid with your real XP.')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('musictest')
+    .setDescription('Mr. Powell gives the class a pop quiz. First correct answer wins XP.')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('duel')
+    .setDescription('Challenge a student to a duel. Winner takes XP from the loser.')
+    .addUserOption(o => o.setName('user').setDescription('The student to challenge').setRequired(true))
+    .toJSON(),
 ];
 
 // ─── Error Listeners ─────────────────────────────────────────────────────────
@@ -255,12 +283,17 @@ client.on('guildMemberAdd', async (member) => {
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isModalSubmit()) {
     if (interaction.customId.startsWith('bell_guess_modal__')) await handleBellGuessModal(interaction);
+    if (interaction.customId === 'auction_bid_modal')          await handleAuctionBidModal(interaction);
     return;
   }
 
   if (interaction.isButton()) {
     if (interaction.customId.startsWith('bell_guess_btn__'))    await handleBellGuessButton(interaction);
     if (interaction.customId.startsWith('discipline_appeal__')) await handleDisciplineAppeal(interaction);
+    if (interaction.customId === 'heist_join')                  await handleHeistJoin(interaction);
+    if (interaction.customId === 'auction_bid_btn')             await handleAuctionBidButton(interaction);
+    if (interaction.customId.startsWith('quiz_answer__'))       await handleQuizAnswer(interaction);
+    if (interaction.customId.startsWith('duel_accept__'))       await handleDuelAccept(interaction);
     return;
   }
 
@@ -280,6 +313,10 @@ client.on('interactionCreate', async (interaction) => {
     case 'absent':      await handleAbsent(interaction);      break;
     case 'powellsays':  await handlePowellSays(interaction);  break;
     case 'beef':        await handleBeef(interaction);        break;
+    case 'heist':       await handleHeist(interaction);       break;
+    case 'auction':     await handleAuction(interaction);     break;
+    case 'musictest':   await handleMusicTest(interaction);   break;
+    case 'duel':        await handleDuel(interaction);        break;
   }
 });
 
@@ -640,6 +677,20 @@ async function handleGametime(interaction) {
 async function handleMVP(interaction) {
   const target = interaction.options.getUser('user');
 
+  if (target.id === interaction.user.id) {
+    await interaction.reply({ content: 'Mr. Powell says you cannot name yourself MVP. Sit down.', ephemeral: true });
+    return;
+  }
+
+  const lastUsed = mvpCooldowns.get(interaction.user.id);
+  if (lastUsed && Date.now() - lastUsed < 60 * 60 * 1000) {
+    const minutesLeft = Math.ceil((60 * 60 * 1000 - (Date.now() - lastUsed)) / 60000);
+    await interaction.reply({ content: `Mr. Powell says you already named an MVP recently. You can do it again in **${minutesLeft} minute${minutesLeft !== 1 ? 's' : ''}**.`, ephemeral: true });
+    return;
+  }
+
+  mvpCooldowns.set(interaction.user.id, Date.now());
+
   const messages = [
     `Mr. Powell has named ${target} as tonight's MVP. They have been awarded First Chair, which carries no actual privileges but significant respect.`,
     `Tonight's MVP is ${target}. Mr. Powell noticed, which is rare. He is still processing his feelings about it.`,
@@ -736,6 +787,534 @@ async function handleBeef(interaction) {
   ];
 
   await interaction.reply(verdicts[Math.floor(Math.random() * verdicts.length)]);
+}
+
+// ─── Heist ────────────────────────────────────────────────────────────────────
+
+const HEIST_SECONDS = 30;
+const HEIST_XP_WIN  = 50;
+const HEIST_XP_LOSE = 5;
+
+function buildHeistEmbed(heist, resolved, success) {
+  const names = [...heist.joiners.values()];
+
+  if (!resolved) {
+    return new EmbedBuilder()
+      .setTitle('🔔 Bell Room Heist')
+      .setDescription(
+        `**${names[0]}** is planning a heist on Mr. Powell's bell room.\n` +
+        `Mr. Powell is in his office grading papers. This is your chance.\n` +
+        `You have **${HEIST_SECONDS} seconds** to join.`
+      )
+      .addFields({ name: `🦹 Crew (${names.length})`, value: names.map(n => `• ${n}`).join('\n') })
+      .setColor(0xFF4500)
+      .setFooter({ text: 'Success is not guaranteed. More crew helps.' });
+  }
+
+  const crewList = names.map(n => `• ${n}`).join('\n');
+
+  if (success) {
+    const lines = [
+      'The crew slipped in and out. The bell is gone. Mr. Powell returned to an empty shelf and has not moved in three minutes.',
+      'Flawless execution. Mr. Powell suspects nothing. The bell has been relocated. He is writing a strongly worded memo.',
+      'The heist worked. Mr. Powell is filing a formal report. The crew is not yet a suspect.',
+    ];
+    return new EmbedBuilder()
+      .setTitle('✅ Heist Successful')
+      .setDescription(lines[Math.floor(Math.random() * lines.length)] + `\n\n**+${HEIST_XP_WIN} XP each.**`)
+      .addFields({ name: '🦹 Crew', value: crewList })
+      .setColor(0x00C851);
+  }
+
+  const lines = [
+    `Mr. Powell came back early. The entire crew was caught near the instrument cabinet. Everyone has been written on the board.`,
+    `Someone knocked over the triangle. Mr. Powell heard it from the hallway. Crew apprehended.`,
+    `The heist failed at the last second. Mr. Powell was not in his office. He was watching. He is always watching.`,
+  ];
+  return new EmbedBuilder()
+    .setTitle('❌ Heist Failed')
+    .setDescription(lines[Math.floor(Math.random() * lines.length)] + `\n\n**+${HEIST_XP_LOSE} XP for the attempt.**`)
+    .addFields({ name: '🚨 Caught', value: crewList })
+    .setColor(0x808080);
+}
+
+async function resolveHeist() {
+  if (!activeHeist) return;
+  const heist = activeHeist;
+  activeHeist = null;
+
+  const successChance = Math.min(0.8, 0.2 + heist.joiners.size * 0.15);
+  const success       = Math.random() < successChance;
+
+  heist.joiners.forEach((_, userId) => addXP(userId, success ? HEIST_XP_WIN : HEIST_XP_LOSE));
+
+  try {
+    await heist.message.edit({ embeds: [buildHeistEmbed(heist, true, success)], components: [] });
+  } catch (err) {
+    console.error('Failed to resolve heist:', err);
+  }
+}
+
+async function handleHeist(interaction) {
+  if (activeHeist) {
+    await interaction.reply({ content: 'Mr. Powell says a heist is already being planned. Wait your turn.', ephemeral: true });
+    return;
+  }
+
+  activeHeist = {
+    initiatorId: interaction.user.id,
+    joiners:     new Map([[interaction.user.id, interaction.user.username]]),
+    message:     null,
+    timer:       null,
+  };
+
+  const joinRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('heist_join')
+      .setLabel('Join the Heist')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('🔔')
+  );
+
+  await interaction.reply({ embeds: [buildHeistEmbed(activeHeist, false, null)], components: [joinRow] });
+  activeHeist.message = await interaction.fetchReply();
+  activeHeist.timer   = setTimeout(resolveHeist, HEIST_SECONDS * 1000);
+}
+
+async function handleHeistJoin(interaction) {
+  if (!activeHeist) {
+    await interaction.reply({ content: 'The heist window has closed. Too slow.', ephemeral: true });
+    return;
+  }
+  if (activeHeist.joiners.has(interaction.user.id)) {
+    await interaction.reply({ content: 'Mr. Powell says you are already in this crew.', ephemeral: true });
+    return;
+  }
+
+  activeHeist.joiners.set(interaction.user.id, interaction.user.username);
+
+  const joinRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('heist_join')
+      .setLabel('Join the Heist')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('🔔')
+  );
+
+  await interaction.update({ embeds: [buildHeistEmbed(activeHeist, false, null)], components: [joinRow] });
+}
+
+// ─── Auction ──────────────────────────────────────────────────────────────────
+
+const AUCTION_TITLES = [
+  'First Chair',
+  'Bell Keeper',
+  'Trusted With the Instruments',
+  "Teacher's Pet",
+  'Front Row Privilege',
+  'Class Representative',
+  'Honorary Drum Major',
+  'Substitute Teacher Candidate',
+];
+
+const AUCTION_SECONDS = 60;
+
+function buildAuctionEmbed(auction, resolved) {
+  if (!resolved) {
+    const secondsLeft = Math.max(0, Math.ceil((auction.endsAt - Date.now()) / 1000));
+    return new EmbedBuilder()
+      .setTitle('🏷️ Class Title Auction')
+      .setDescription(
+        `Mr. Powell is auctioning the title of **"${auction.title}"**.\n` +
+        `Highest bidder wins. Bids come out of your actual XP.\n` +
+        `Auction closes in **${secondsLeft}s**.`
+      )
+      .addFields({
+        name:  'Current Bid',
+        value: auction.topBid > 0
+          ? `**${auction.topBid} XP** — ${auction.topBidderName}`
+          : 'No bids yet — starting at 1 XP',
+      })
+      .setColor(0xFFD700)
+      .setFooter({ text: 'Mr. Powell will record the winner in the gradebook.' });
+  }
+
+  if (!auction.topBidderId) {
+    return new EmbedBuilder()
+      .setTitle('🏷️ Auction Closed — No Bids')
+      .setDescription(`Nobody bid on **"${auction.title}"**. Mr. Powell is unsurprised. The title goes unclaimed.`)
+      .setColor(0x808080);
+  }
+
+  return new EmbedBuilder()
+    .setTitle('🏷️ Auction Closed')
+    .setDescription(
+      `**${auction.topBidderName}** has won the title of **"${auction.title}"** for **${auction.topBid} XP**.\n` +
+      `Mr. Powell has updated the gradebook. The title is now official.`
+    )
+    .setColor(0xFFD700);
+}
+
+async function resolveAuction() {
+  if (!activeAuction) return;
+  const auction = activeAuction;
+  activeAuction = null;
+
+  if (auction.topBidderId) addXP(auction.topBidderId, -auction.topBid);
+
+  try {
+    await auction.message.edit({ embeds: [buildAuctionEmbed(auction, true)], components: [] });
+  } catch (err) {
+    console.error('Failed to resolve auction:', err);
+  }
+}
+
+async function handleAuction(interaction) {
+  if (activeAuction) {
+    await interaction.reply({ content: 'Mr. Powell says an auction is already in progress.', ephemeral: true });
+    return;
+  }
+
+  const title = AUCTION_TITLES[Math.floor(Math.random() * AUCTION_TITLES.length)];
+
+  activeAuction = {
+    title,
+    topBid:        0,
+    topBidderId:   null,
+    topBidderName: null,
+    endsAt:        Date.now() + AUCTION_SECONDS * 1000,
+    message:       null,
+    timer:         null,
+  };
+
+  const bidRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('auction_bid_btn')
+      .setLabel('Place a Bid')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('💰')
+  );
+
+  await interaction.reply({ embeds: [buildAuctionEmbed(activeAuction, false)], components: [bidRow] });
+  activeAuction.message = await interaction.fetchReply();
+  activeAuction.timer   = setTimeout(resolveAuction, AUCTION_SECONDS * 1000);
+}
+
+async function handleAuctionBidButton(interaction) {
+  if (!activeAuction) {
+    await interaction.reply({ content: 'The auction has already closed.', ephemeral: true });
+    return;
+  }
+
+  const userXP = getXP(interaction.user.id);
+
+  await interaction.showModal(
+    new ModalBuilder()
+      .setCustomId('auction_bid_modal')
+      .setTitle(`Bid on: ${activeAuction.title}`)
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('bid_amount')
+            .setLabel(`Your XP: ${userXP} | Current bid: ${activeAuction.topBid}`)
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(6)
+            .setPlaceholder(`Enter more than ${activeAuction.topBid}`)
+        )
+      )
+  );
+}
+
+async function handleAuctionBidModal(interaction) {
+  if (!activeAuction) {
+    await interaction.reply({ content: 'The auction closed while you were typing. Bad timing.', ephemeral: true });
+    return;
+  }
+
+  const amount = parseInt(interaction.fields.getTextInputValue('bid_amount'), 10);
+  const userXP = getXP(interaction.user.id);
+
+  if (isNaN(amount) || amount <= 0) {
+    await interaction.reply({ content: 'Mr. Powell says that is not a valid bid.', ephemeral: true });
+    return;
+  }
+  if (amount > userXP) {
+    await interaction.reply({ content: `You only have **${userXP} XP**. You cannot bid **${amount}**.`, ephemeral: true });
+    return;
+  }
+  if (amount <= activeAuction.topBid) {
+    await interaction.reply({ content: `Your bid of **${amount} XP** does not beat the current bid of **${activeAuction.topBid} XP**. Bid higher.`, ephemeral: true });
+    return;
+  }
+
+  activeAuction.topBid        = amount;
+  activeAuction.topBidderId   = interaction.user.id;
+  activeAuction.topBidderName = interaction.user.username;
+
+  await interaction.reply({
+    content:   `Your bid of **${amount} XP** is accepted. You are currently winning **"${activeAuction.title}"**.`,
+    ephemeral: true,
+  });
+
+  const bidRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('auction_bid_btn')
+      .setLabel('Place a Bid')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('💰')
+  );
+
+  try {
+    await activeAuction.message.edit({ embeds: [buildAuctionEmbed(activeAuction, false)], components: [bidRow] });
+  } catch (err) {
+    console.error('Failed to update auction message:', err);
+  }
+}
+
+// ─── Music Test ───────────────────────────────────────────────────────────────
+
+const QUIZ_QUESTIONS = [
+  { question: 'What does "forte" mean in music?',                                               options: ['Soft', 'Loud', 'Fast', 'Slow'],                                                        correct: 1 },
+  { question: 'How many strings does a standard guitar have?',                                  options: ['4', '5', '6', '7'],                                                                   correct: 2 },
+  { question: 'What is a musical "rest"?',                                                      options: ['A type of chord', 'A silence between notes', 'A time signature', 'A key change'],    correct: 1 },
+  { question: 'What does "piano" mean as a dynamic marking?',                                   options: ['Fast', 'Loud', 'Soft', 'Slow'],                                                       correct: 2 },
+  { question: 'How many beats are in a measure of 4/4 time?',                                   options: ['2', '3', '4', '8'],                                                                   correct: 2 },
+  { question: 'What does "crescendo" mean?',                                                    options: ['Gradually louder', 'Gradually softer', 'Suddenly loud', 'Suddenly soft'],             correct: 0 },
+  { question: 'How many lines are on a standard musical staff?',                                options: ['3', '4', '5', '6'],                                                                   correct: 2 },
+  { question: 'What tempo is "Allegro"?',                                                       options: ['Very slow', 'Moderate', 'Fast', 'Very fast'],                                         correct: 2 },
+  { question: 'What is the highest standard vocal range?',                                      options: ['Alto', 'Tenor', 'Soprano', 'Bass'],                                                   correct: 2 },
+  { question: 'What does "mezzo-forte" mean?',                                                  options: ['Very soft', 'Moderately loud', 'Very loud', 'Moderately soft'],                       correct: 1 },
+  { question: 'What is the lowest-pitched brass instrument?',                                   options: ['Trumpet', 'Trombone', 'French Horn', 'Tuba'],                                         correct: 3 },
+  { question: 'What does "banaga" mean according to Mr. Powell?',                               options: ['A rhythm style', 'A type of instrument', 'Mr. Powell does not know', 'A key signature'], correct: 2 },
+  { question: 'Which instrument is Mr. Powell most likely to confiscate?',                      options: ['The violin', 'The recorder', 'The triangle', 'The xylophone'],                        correct: 1 },
+  { question: 'According to Mr. Powell, which instrument should not try to be the drum?',       options: ['The guitar', 'The flute', 'The triangle', 'The bass'],                                correct: 2 },
+  { question: 'What percentage of your grade is class participation, according to Mr. Powell?', options: ['10%', '20%', '30%', '40%'],                                                           correct: 3 },
+];
+
+const QUIZ_SECONDS  = 30;
+const QUIZ_XP_WIN   = 20;
+const QUIZ_XP_WRONG = -5;
+
+function buildQuizEmbed(quiz, winnerName, expired) {
+  const labels      = ['A', 'B', 'C', 'D'];
+  const optionLines = quiz.options.map((opt, i) => `**${labels[i]}.** ${opt}`).join('\n');
+
+  if (expired) {
+    return new EmbedBuilder()
+      .setTitle('📝 Pop Quiz — Time\'s Up')
+      .setDescription(
+        `Nobody answered correctly in time.\n` +
+        `The answer was **${labels[quiz.correctIndex]}. ${quiz.options[quiz.correctIndex]}**.\n` +
+        `Mr. Powell is not impressed.`
+      )
+      .setColor(0x808080);
+  }
+
+  if (winnerName) {
+    return new EmbedBuilder()
+      .setTitle('📝 Correct!')
+      .setDescription(
+        `**${winnerName}** got it right.\n\n` +
+        `**${quiz.question}**\n\n${optionLines}\n\n` +
+        `✅ **${labels[quiz.correctIndex]}. ${quiz.options[quiz.correctIndex]}** — **+${QUIZ_XP_WIN} XP**`
+      )
+      .setColor(0x00C851);
+  }
+
+  return new EmbedBuilder()
+    .setTitle('📝 Mr. Powell\'s Pop Quiz')
+    .setDescription(`**${quiz.question}**\n\n${optionLines}`)
+    .setColor(0x5865F2)
+    .setFooter({ text: `First correct answer: +${QUIZ_XP_WIN} XP. Wrong answer: ${QUIZ_XP_WRONG} XP. ${QUIZ_SECONDS} seconds.` });
+}
+
+function buildQuizRow() {
+  return new ActionRowBuilder().addComponents(
+    ...['A', 'B', 'C', 'D'].map((label, i) =>
+      new ButtonBuilder()
+        .setCustomId(`quiz_answer__${i}`)
+        .setLabel(label)
+        .setStyle(ButtonStyle.Primary)
+    )
+  );
+}
+
+async function handleMusicTest(interaction) {
+  if (activeQuiz) {
+    await interaction.reply({ content: 'Mr. Powell says a quiz is already in session. Pay attention.', ephemeral: true });
+    return;
+  }
+
+  const q = QUIZ_QUESTIONS[Math.floor(Math.random() * QUIZ_QUESTIONS.length)];
+
+  activeQuiz = {
+    question:     q.question,
+    options:      q.options,
+    correctIndex: q.correct,
+    message:      null,
+    timer:        null,
+  };
+
+  await interaction.reply({ embeds: [buildQuizEmbed(activeQuiz, null, false)], components: [buildQuizRow()] });
+  activeQuiz.message = await interaction.fetchReply();
+
+  activeQuiz.timer = setTimeout(async () => {
+    if (!activeQuiz) return;
+    const quiz = activeQuiz;
+    activeQuiz = null;
+    try {
+      await quiz.message.edit({ embeds: [buildQuizEmbed(quiz, null, true)], components: [] });
+    } catch (err) {
+      console.error('Failed to expire quiz:', err);
+    }
+  }, QUIZ_SECONDS * 1000);
+}
+
+async function handleQuizAnswer(interaction) {
+  if (!activeQuiz) {
+    await interaction.reply({ content: 'No active quiz.', ephemeral: true });
+    return;
+  }
+
+  const optionIndex = parseInt(interaction.customId.split('__')[1], 10);
+
+  if (optionIndex === activeQuiz.correctIndex) {
+    clearTimeout(activeQuiz.timer);
+    const quiz = activeQuiz;
+    activeQuiz = null;
+    addXP(interaction.user.id, QUIZ_XP_WIN);
+    await interaction.update({ embeds: [buildQuizEmbed(quiz, interaction.user.username, false)], components: [] });
+  } else {
+    addXP(interaction.user.id, QUIZ_XP_WRONG);
+    await interaction.reply({ content: `Wrong. Mr. Powell has noted your answer. **${QUIZ_XP_WRONG} XP.**`, ephemeral: true });
+  }
+}
+
+// ─── Duel ─────────────────────────────────────────────────────────────────────
+
+const DUEL_STAKE   = 20;
+const DUEL_SECONDS = 30;
+
+const DUEL_ROUNDS = [
+  'Recorder Showdown', 'Rhythm Battle', 'Music Theory Quiz',
+  'Sight-Reading Test', 'Instrument Assembly Speed Run',
+  'Triangle Solo', 'Air Guitar Competition', 'Metronome Challenge',
+  'Tambourine Duel', 'Name That Tune',
+];
+
+async function handleDuel(interaction) {
+  const challenger = interaction.user;
+  const target     = interaction.options.getUser('user');
+
+  if (target.id === challenger.id) {
+    await interaction.reply({ content: 'Mr. Powell says you cannot duel yourself. Sit down.', ephemeral: true });
+    return;
+  }
+  if (target.bot) {
+    await interaction.reply({ content: 'Mr. Powell says you cannot duel a bot. That is not a real student.', ephemeral: true });
+    return;
+  }
+  if (activeDuels.has(challenger.id)) {
+    await interaction.reply({ content: 'You already have a pending duel. Resolve it first.', ephemeral: true });
+    return;
+  }
+
+  activeDuels.set(challenger.id, {
+    challengerId:   challenger.id,
+    challengerName: challenger.username,
+    targetId:       target.id,
+    targetName:     target.username,
+    message:        null,
+    timer:          null,
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle('⚔️ Duel Challenge')
+    .setDescription(
+      `${challenger} has challenged ${target} to a duel.\n` +
+      `**Stake: ${DUEL_STAKE} XP**\n\n` +
+      `${target}, you have ${DUEL_SECONDS} seconds to accept.\n` +
+      `Mr. Powell will oversee this. He did not ask for this responsibility.`
+    )
+    .setColor(0xFF4500);
+
+  const acceptRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`duel_accept__${challenger.id}`)
+      .setLabel('Accept the Duel')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('⚔️')
+  );
+
+  await interaction.reply({ embeds: [embed], components: [acceptRow] });
+  const message = await interaction.fetchReply();
+  activeDuels.get(challenger.id).message = message;
+
+  activeDuels.get(challenger.id).timer = setTimeout(async () => {
+    if (!activeDuels.has(challenger.id)) return;
+    activeDuels.delete(challenger.id);
+    try {
+      await message.edit({
+        embeds: [new EmbedBuilder()
+          .setTitle('⚔️ Duel Expired')
+          .setDescription(`${target} did not respond in time. Mr. Powell has noted the cowardice. Duel cancelled.`)
+          .setColor(0x808080)],
+        components: [],
+      });
+    } catch (err) {
+      console.error('Failed to expire duel:', err);
+    }
+  }, DUEL_SECONDS * 1000);
+}
+
+async function handleDuelAccept(interaction) {
+  const challengerId = interaction.customId.split('__')[1];
+  const duel         = activeDuels.get(challengerId);
+
+  if (!duel) {
+    await interaction.reply({ content: 'This duel has already expired.', ephemeral: true });
+    return;
+  }
+  if (interaction.user.id !== duel.targetId) {
+    await interaction.reply({ content: 'Mr. Powell says this duel is not yours to accept.', ephemeral: true });
+    return;
+  }
+
+  clearTimeout(duel.timer);
+  activeDuels.delete(challengerId);
+
+  const rounds       = [...DUEL_ROUNDS].sort(() => Math.random() - 0.5).slice(0, 3);
+  let challengerWins = 0;
+  let targetWins     = 0;
+
+  const roundResults = rounds.map(name => {
+    const challengerWon = Math.random() < 0.5;
+    if (challengerWon) challengerWins++;
+    else               targetWins++;
+    return `**${name}:** ${challengerWon ? duel.challengerName : duel.targetName} wins`;
+  });
+
+  const challengerWon = challengerWins > targetWins;
+  const winnerId      = challengerWon ? duel.challengerId : duel.targetId;
+  const loserId       = challengerWon ? duel.targetId    : duel.challengerId;
+  const winnerName    = challengerWon ? duel.challengerName : duel.targetName;
+  const loserName     = challengerWon ? duel.targetName    : duel.challengerName;
+
+  addXP(winnerId,  DUEL_STAKE);
+  addXP(loserId,  -DUEL_STAKE);
+
+  const embed = new EmbedBuilder()
+    .setTitle('⚔️ Duel Complete')
+    .setDescription(
+      `Mr. Powell presided over the duel. The results are final.\n\n` +
+      roundResults.join('\n') + `\n\n` +
+      `**${winnerName}** wins **${DUEL_STAKE} XP** from **${loserName}**.`
+    )
+    .setColor(0xFFD700)
+    .setFooter({ text: `Score: ${challengerWins}-${targetWins} | Mr. Powell is filing this in the gradebook.` });
+
+  await interaction.update({ embeds: [embed], components: [] });
 }
 
 // ─── Express Web Server ───────────────────────────────────────────────────────
